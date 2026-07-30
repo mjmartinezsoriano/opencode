@@ -29,6 +29,7 @@ import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
+import * as ThinkTagMiddleware from "./llm/think-tag-middleware"
 
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
 
@@ -339,6 +340,16 @@ const live: Layer.Layer<
                   return args.params
                 },
               },
+              // Some providers (currently MiniMax-M3 via OpenAI-compatible
+              // Chat Completions) emit chain-of-thought inline as `顕...`
+              // tags in text content rather than as `reasoning_content` on
+              // the response. Splitting those into structured reasoning
+              // events lets the rest of the pipeline collapse them like any
+              // other model's reasoning. See shouldParseThinkTags() for the
+              // narrow set of providers this is enabled for.
+              ...(ProviderTransform.shouldParseThinkTags(input.model)
+                ? [ThinkTagMiddleware.createThinkTagMiddleware()]
+                : []),
             ],
           }),
           experimental_telemetry: {

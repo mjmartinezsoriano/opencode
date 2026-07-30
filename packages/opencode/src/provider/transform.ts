@@ -565,6 +565,25 @@ export function topK(model: Provider.Model) {
   return undefined
 }
 
+// MiniMax-M3 (via the OpenAI-compatible endpoint) emits chain-of-thought inline
+// as `顕...` tags in text content rather than as `reasoning_content` on the
+// response. Without a parser the thinking is rendered fully expanded inside
+// the text part; with one it can be split into a reasoning part that the TUI
+// (and other consumers) already know how to collapse.
+//
+// We scope this narrowly to M3 to keep the parser out of the hot path for any
+// provider that already returns structured reasoning. Add more models here only
+// after verifying their inline-think payload format.
+export function shouldParseThinkTags(model: Provider.Model): boolean {
+  const id = model.api.id.toLowerCase()
+  const providerId = model.providerID.toLowerCase()
+  if (!id.includes("minimax-m3")) return false
+  if (providerId !== "minimax") return false
+  // The Anthropic-compatible path emits thinking as reasoning blocks already.
+  // Only the OpenAI Chat Completions path needs inline-tag parsing.
+  return model.api.npm === "@ai-sdk/openai-compatible"
+}
+
 const WIDELY_SUPPORTED_EFFORTS = ["low", "medium", "high"]
 const OPENAI_EFFORTS = ["none", "minimal", ...WIDELY_SUPPORTED_EFFORTS, "xhigh"]
 const OPENAI_GPT5_1_EFFORTS = ["none", ...WIDELY_SUPPORTED_EFFORTS]
