@@ -26,6 +26,48 @@ export const DEFAULT_TIMEOUT_MS = 2 * 60 * 1_000
 // How long a call the user interrupted waits for its stopped command to exit before settling with the output so far.
 const INTERRUPT_WAIT = "500 millis"
 
+/**
+ * AUTO-BACKGROUND: a los quantos milisegundos un comando en foreground se
+ * pasa a background SOLO, sin que el modelo lo pida.
+ *
+ * POR QUE (MEDIDO 2026-11-11)
+ * ============================
+ * El servicio de background YA existeia entero: `Job.background(id)` marca el
+ * job como background, `Job.block` espera en
+ * `Deferred.raceFirst(done, backgrounded)`, y el codigo de mas abajo (la rama
+ * `result?.type === "backgrounded"`) ya sabe hacer todo lo que hace falta:
+ * quitar el timeout, avisar al terminar y devolver el `shellID`.
+ *
+ * Lo que faltaba era el "quien": el modelo tenia que acordarse de pasar
+ * `background: true`. Si no lo hacia, el comando corria en foreground con
+ * `DEFAULT_TIMEOUT_MS` (2 minutos) y ACABABA MATADO a los 2 minutos con exit
+ * 124, cuando el trabajo real iba a terminarse solo. Una tarea de 3 minutos
+ * se quedaba a medias por un timeout, no por un error.
+ *
+ * QUE HACE ESTE CAMBIO
+ * ====================
+ * Cuando el comando NO pide background explicito, se arranca un temporizador
+ * de `AUTO_BACKGROUND_MS`. Si ahi sigue vivo, se llama a `jobs.background()`:
+ * el `block` se resuelve como "backgrounded" y el flujo existente se encarga
+ * del resto. Si el comando termina antes, no se toca nada.
+ *
+ * OJO con el timeout de 2 minutos: NO se quita. Es la red de seguridad para
+ * un comando que se cuelga de verdad. El auto no mata nada: solo deja de
+ * matar. Un comando colgado en foreground se queda en foreground (y muere a
+ * los 2 min), que es lo correcto: si se promoviese a background, se
+ * quedaria colgado para siempre sin que el turno avanzara.
+ *
+ * `0` desactiva el auto (para tests y para quien prefiera el comportamiento
+ * actual). Se puede ajustar por entorno: `OPENCODE_AUTO_BACKGROUND_MS`.
+ */
+export const AUTO_BACKGROUND_MS = (() => {
+  const raw = process.env.OPENCODE_AUTO_BACKGROUND_MS
+  if (raw === undefined) return 30_000
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed) || parsed < 0) return 30_000
+  return parsed
+})()
+
 const BACKGROUND_INSTRUCTION =
   "You will be notified automatically when the command finishes. The notification will include the command's output. Unless the user explicitly asks otherwise, DO NOT poll for completion, even if you need the final result to continue. Repeatedly sleeping and reading or searching the output file is polling, not useful work. You may read the current output if it lets you do useful work now, but do not repeatedly check it while waiting for the command to finish. Keep working on anything that does not depend on the result. If you have nothing else to do, end your response; you will be resumed automatically when the command finishes."
 const OS =
@@ -422,49 +464,89 @@ export const Plugin = {
                     return backgroundResult(info, yield* Clock.currentTimeMillis)
                   }
 
-                  const waiting = jobs.block({ id: job.id, sessionID: context.sessionID })
-                  const blocked =
-                    finalTimeout > 0
-                      ? waiting.pipe(
-                          Effect.timeoutOption(finalTimeout),
-                          Effect.flatMap((result) =>
-                            Option.isSome(result)
-                              ? Effect.succeed(result.value)
-                              : jobs
-                                  .background(job.id)
-                                  .pipe(
-                                    Effect.map((info) =>
-                                      info ? { type: "backgrounded" as const, info, timedOut: true } : undefined,
+                    const waiting = jobs.block({ id: job.id, sessionID: context.sessionID })
+
+                    // AUTO-BACKGROUND (MEDIDO 2026-11-11): si el comando sigue vivo a los
+                    // AUTO_BACKGROUND_MS (30 s), se pasa a background SOLO, sin que el modelo
+                    // lo pida. Upstream mueve a background al EXPIRAR el timeout (2 min por
+                    // defecto, ver `blocked` mas abajo); este lo adelanta a 30 s, que es el
+                    // umbral de AGENTS.md. El timeout de 2 min NO se quita: sigue siendo la
+                    // red de seguridad para un comando colgado de verdad (el auto no mata
+                    // nada, solo deja de matar).
+                    //
+                    // Se hace con una rama del `raceFirst` y NO con un fiber aparte: asi no
+                    // hace falta un Scope (el tool corre con `R = never`) y no queda ningun
+                    // fiber vivo cuando el comando acaba, porque el `raceFirst` interrumpe la
+                    // rama perdedora.
+                    const autoBackground =
+                      AUTO_BACKGROUND_MS > 0
+                        ? Effect.sleep(AUTO_BACKGROUND_MS).pipe(
+                            Effect.andThen(jobs.get(job.id)),
+                            Effect.flatMap((current) =>
+                              // Solo si SIGUE VIVO: un comando que ya termino no se promueve
+                              // (seria marcar como background algo que ya acabo, y avisaria
+                              // de un job que no corre).
+                              current && current.status === "running" ? jobs.background(job.id) : Effect.void,
+                            ),
+                            // La rama del temporizador no "termina": decide el `block` (que se
+                            // resuelve como "backgrounded" porque `jobs.background` resuelve su
+                            // Deferred) y se queda esperando a que el race la interrumpa.
+                            Effect.andThen(Effect.never),
+                          )
+                        : Effect.never
+
+                    const blocked =
+                      finalTimeout > 0
+                        ? waiting.pipe(
+                            Effect.timeoutOption(finalTimeout),
+                            Effect.flatMap((result) =>
+                              Option.isSome(result)
+                                ? Effect.succeed(result.value)
+                                : jobs
+                                    .background(job.id)
+                                    .pipe(
+                                      Effect.map((info) =>
+                                        info ? { type: "backgrounded" as const, info, timedOut: true } : undefined,
+                                      ),
                                     ),
-                                  ),
+                            ),
+                          )
+                        : waiting
+                    // A user's stop arrives through `cancel`. Any interrupt stops the command too, unless the server is
+                    // handing its daemon over: then the command and its job keep running, and the next server takes the
+                    // call over and moves the command to the background.
+                    const outcome = yield* restore(
+                      Effect.raceFirst(
+                        blocked.pipe(Effect.map((result) => ({ type: "settled" as const, result }))),
+                        // `Effect.raceFirst` (Effect v4) toma DOS ramas, asi que la del
+                        // auto-background se anida con la del "stopped".
+                        Effect.raceFirst(
+                          autoBackground.pipe(
+                            Effect.map(() => ({
+                              type: "settled" as const,
+                              result: undefined as Job.BlockResult | undefined,
+                            })),
                           ),
-                        )
-                      : waiting
-                  // A user's stop arrives through `cancel`. Any interrupt stops the command too, unless the server is
-                  // handing its daemon over: then the command and its job keep running, and the next server takes the
-                  // call over and moves the command to the background.
-                  const outcome = yield* restore(
-                    Effect.raceFirst(
-                      blocked.pipe(Effect.map((result) => ({ type: "settled" as const, result }))),
-                      Deferred.await(stopped).pipe(Effect.as({ type: "cancelled" as const })),
-                    ),
-                  ).pipe(
-                    Effect.onInterrupt(() =>
-                      shell.handoffPrepared() ? Effect.void : jobs.cancel(job.id).pipe(Effect.ignore),
-                    ),
-                  )
-                  if (outcome.type === "cancelled") return yield* cancelled(info, job.id)
-                  const result = outcome.result
-                  if (result?.type === "backgrounded") {
-                    yield* shell.timeout(info.id, 0)
-                    const elapsed = "timedOut" in result ? finalTimeout : undefined
-                    finalTimeout = 0
-                    yield* notifyWhenDone(context.sessionID, job.id, info.id, info.command, settled)
-                    return backgroundResult(info, yield* Clock.currentTimeMillis, elapsed)
-                  }
-                  if (result?.info.status === "error")
-                    return yield* Effect.fail(new Error(result.info.error ?? "Command failed"))
-                  if (result?.info.status === "cancelled") return yield* Effect.fail(new Error("Command cancelled"))
+                          Deferred.await(stopped).pipe(Effect.as({ type: "cancelled" as const })),
+                        ),
+                      ),
+                    ).pipe(
+                      Effect.onInterrupt(() =>
+                        shell.handoffPrepared() ? Effect.void : jobs.cancel(job.id).pipe(Effect.ignore),
+                      ),
+                    )
+                    if (outcome.type === "cancelled") return yield* cancelled(info, job.id)
+                    const result = outcome.result
+                    if (result?.type === "backgrounded") {
+                      yield* shell.timeout(info.id, 0)
+                      const elapsed = "timedOut" in result ? finalTimeout : undefined
+                      finalTimeout = 0
+                      yield* notifyWhenDone(context.sessionID, job.id, info.id, info.command, settled)
+                      return backgroundResult(info, yield* Clock.currentTimeMillis, elapsed)
+                    }
+                    if (result?.info.status === "error")
+                      return yield* Effect.fail(new Error(result.info.error ?? "Command failed"))
+                    if (result?.info.status === "cancelled") return yield* Effect.fail(new Error("Command cancelled"))
 
                   return yield* Deferred.await(settled)
                 }).pipe(Effect.ensuring(listener ? Fiber.interrupt(listener) : Effect.void))
