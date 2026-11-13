@@ -194,7 +194,7 @@ export const Definitions = {
   "messages.copy": keybind("<leader>y", "Copy message"),
   "session.undo": keybind("<leader>u", "Undo message"),
   "session.redo": keybind("<leader>r", "Redo message"),
-  "session.toggle.thinking": keybind("none", "Toggle thinking blocks visibility"),
+  "session.toggle.thinking": keybind("<leader>t", "Toggle thinking blocks visibility"),
 
   "prompt.submit": keybind("none", "Submit prompt"),
   "prompt.queue": keybind("<leader>return", "Queue prompt"),
