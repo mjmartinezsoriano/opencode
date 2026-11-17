@@ -61,11 +61,7 @@ describe("SkillInstructions", () => {
           "Use the skill tool to load a skill when a task matches its description.",
           "The user may also invoke a skill directly. When that happens, its instructions appear in the conversation as a <skill_content> block, the same shape the skill tool returns. A skill that is already present this way does not need to be invoked again.",
           "<available_skills>",
-          "  <skill>",
-          "    <id>effect</id>",
-          "    <name>Effect</name>",
-          "    <description>Build applications with Effect</description>",
-          "  </skill>",
+          "  <skill id=\"effect\" name=\"Effect\">Build applications with Effect</skill>",
           "</available_skills>",
         ].join("\n"),
       )
@@ -101,11 +97,7 @@ describe("SkillInstructions", () => {
       expect(added.text).toBe(
         [
           "New skills are available in addition to those previously listed:",
-          "  <skill>",
-          "    <id>debugging</id>",
-          "    <name>Debugging</name>",
-          "    <description>Diagnose hard bugs</description>",
-          "  </skill>",
+          "  <skill id=\"debugging\" name=\"Debugging\">Diagnose hard bugs</skill>",
         ].join("\n"),
       )
 
@@ -131,14 +123,29 @@ describe("SkillInstructions", () => {
       expect(changed.text).toBe(
         [
           "The following skills have changed. Each entry replaces the previously listed skill with the same ID:",
-          "  <skill>",
-          "    <id>effect</id>",
-          "    <name>Effect</name>",
-          "    <description>Build applications with Effect v4</description>",
-          "  </skill>",
+          "  <skill id=\"effect\" name=\"Effect\">Build applications with Effect v4</skill>",
         ].join("\n"),
       )
     }).pipe(Effect.provide(layer(() => skills)))
+  })
+
+  it.effect("omits the name attribute when it repeats the id", () => {
+    // MEDIDO 2026-11-17: 72 de 74 skills del catalogo real tienen name == id.
+    // Escribirlo dos veces es markup puro: el id ya lo identifica.
+    const agent = Agent.Info.make(Agent.Info.default(build))
+    const same = Skill.Info.make({
+      id: Skill.ID.make("solo-id"),
+      name: Skill.Name.make("solo-id"),
+      description: "Sufficiently described",
+      path: AbsolutePath.make(path.resolve("/skills/solo-id/SKILL.md")),
+      content: "Guidance",
+    })
+    return Effect.gen(function* () {
+      const instructions = yield* SkillInstructions.Service
+      const initialized = yield* instructions.load(agent.permissions).pipe(Effect.flatMap(readInitial))
+      expect(initialized.text).toContain('  <skill id="solo-id">Sufficiently described</skill>')
+      expect(initialized.text).not.toContain('name="solo-id"')
+    }).pipe(Effect.provide(layer(() => [same])))
   })
 
   it.effect("omits instructions when the selected agent denies all skills", () => {
@@ -178,7 +185,7 @@ describe("SkillInstructions", () => {
       const instructions = yield* SkillInstructions.Service
       expect(
         (yield* instructions.load(agent.permissions).pipe(Effect.flatMap(readInitial))).text,
-      ).toContain("<name>Effect</name>")
+      ).toContain('id="effect" name="Effect"')
     }).pipe(Effect.provide(layer(() => [effect])))
   })
 

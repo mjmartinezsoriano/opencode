@@ -13,14 +13,27 @@ const Summary = Schema.Struct({
 })
 type Summary = typeof Summary.Type
 
+/**
+ * MEDIDO 2026-11-17 (ADR L190): el catalogo de skills es el BLOQUE MAS CARO del
+ * prompt real (10.208 tokens = 43,5 % del system; ADR L188/L189). El markup de
+ * 5 lineas por skill costaba 6.364 chars (1.591 tok) para decir exactamente lo
+ * mismo que 1 linea. Cero perdida de informacion:
+ *   - el <name> solo se escribe cuando difiere del <id>: MEDIDO, 72 de 74
+ *     skills tienen name == id (los 2 que no: opencode/OpenCode, report/Report)
+ *   - la <description> sigue siendo TEXTO DE ELEMENTO (como antes): MEDIDO, 26
+ *     descripciones contienen comillas dobles y 2 contienen '<', que como
+ *     atributo habria que escapar (y el modelo leeria el escapado, no el texto)
+ */
+const escapeAttr = (value: string) => value.replace(/&/g, "&amp;").replace(/"/g, "&quot;")
+
 const entries = (skills: ReadonlyArray<Summary>) =>
-  skills.flatMap((skill) => [
-    "  <skill>",
-    `    <id>${skill.id}</id>`,
-    `    <name>${skill.name}</name>`,
-    `    <description>${skill.description}</description>`,
-    "  </skill>",
-  ])
+  skills.map((skill) =>
+    [
+      `  <skill id="${escapeAttr(skill.id)}"`,
+      skill.name === skill.id ? "" : ` name="${escapeAttr(skill.name)}"`,
+      `>${skill.description}</skill>`,
+    ].join(""),
+  )
 
 const render = (skills: ReadonlyArray<Summary>) =>
   [
