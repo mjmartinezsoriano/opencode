@@ -31,6 +31,57 @@ const skillToolNode = makeLocationNode({
 const sessionID = Session.ID.make("ses_skill_tool_test")
 
 describe("SkillTool", () => {
+  it.live("loads a skill that is hidden from the catalog (autoinvoke: false)", () =>
+    // MEDIDO 2026-11-17 (ADR L190): P3b oculta del CATALOGO las skills que no
+    // se han invocado nunca (`metadata.opencode/autoinvoke: false`). Este test
+    // protege el invariante que hace seguro hacerlo: ocultar una skill del
+    // menu NO la vuelve inaccesible: el tool la busca por id en el servicio.
+    tmpdirScoped().pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          const directory = path.join(tmp.path, "hidden")
+          const location = path.join(directory, "SKILL.md")
+          yield* Effect.promise(() => fs.mkdir(directory, { recursive: true }))
+          yield* Effect.promise(() => fs.writeFile(location, "unused"))
+
+          const hidden: Skill.Info = {
+            id: Skill.ID.make("hidden-skill"),
+            name: Skill.Name.make("Hidden Skill"),
+            description: "Use when never",
+            autoinvoke: false,
+            path: AbsolutePath.make(location),
+            content: "# Hidden Skill\n\nGuidance",
+          }
+          const current = [hidden]
+          const skills = Layer.mock(Skill.Service, {
+            get: (id) => Effect.succeed(current.find((skill) => skill.id === id)),
+            files: () => Effect.undefined,
+            list: () => Effect.succeed(current),
+          })
+          const skillToolLayer = AppNodeBuilder.build(LayerNode.group([Tool.node, skillToolNode]), [
+            ...toolNodeReplacements(permissionLayer({ assert: () => Effect.void })),
+            Skill.node.replace(skills),
+          ])
+
+          return yield* Effect.gen(function* () {
+            const registry = yield* Tool.Service
+            const result = yield* executeTool(registry, {
+              sessionID,
+              ...toolIdentity,
+              call: {
+                type: "tool-call",
+                id: "call-hidden-skill",
+                name: "skill",
+                input: { id: "hidden-skill" },
+              },
+            })
+            expect(result).toMatchObject({ status: "completed" })
+          }).pipe(Effect.provide(skillToolLayer))
+        }),
+      ),
+    ),
+  )
+
   it.effect("refuses a policy-blocked skill before authorization or content preparation", () =>
     Effect.gen(function* () {
       const skills = yield* Skill.Service
